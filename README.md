@@ -1,110 +1,136 @@
+#!/usr/bin/env python3
+"""
+cloud_vlm_node.py — 云端图生文节点 (DashScope Qwen-VL)
+USB相机 -> ROS2 -> 阿里百炼API -> /vlm/description
+"""
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+from cv_bridge import CvBridge
+import requests
+import base64
+import time
+import os
 
 
-## 第二十一届全国大学生智能汽车竞赛 — 地瓜机器人创意组智慧医疗赛项
-
----
-
-## 一、参赛队伍基本信息
-
-| 项目 | 内容 |
-|------|------|
-| **队伍名称** | 时代马戏团 |
-| **所属学校** | 浙江交通职业技术学院 |
-| **赛区** | 浙江赛区 |
-| **竞赛组别** | 地瓜机器人创意组 / 智慧医疗赛项 |
-
-### 队员信息
-
-| 序号 | 姓名 | 专业 | 分工 |
-|------|------|------|------|
-| 1 | 周鑫雨 | 物联网应用技术 |底层驱动、传感数据处理|
-| 2 | 盘志诚 | 物联网应用技术 |机器人运动控制算法开发|
-| 3 | 吴喻山 |  智能交通技术  |整机联调、现场测试优化|
-| 4 | 蔡佳怡 |  智能交通技术  |竞赛方案、技术文档编写|
-| 5 | 应羽彤 |  智能交通技术  |传感器接线、硬件装配调试|
-
-### 指导教师
-
-|  姓名  |  职称  | 所属单位 |
-|--------|--------|----------|
-| 蒋晨歆 |  指导老师  | 浙江交通职业技术学院   |
-|--------|--------|----------|
-| 钟佳绮 |  指导老师  | 浙江交通职业技术学院   |
+DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 
 
----
+class CloudVLMNode(Node):
+      def __init__(self):
+          super().__init__('cloud_vlm_node')
 
-## 二、整体技术路线与系统构成概述
+          self.declare_parameter('api_key', os.environ.get('DASHSCOPE_API_KEY', ''))
+          self.declare_parameter('model', 'qwen-vl-max')
+          self.declare_parameter('inference_hz', 0.1)
+          self.declare_parameter('camera_topic', '/image_raw')
+          self.declare_parameter('max_tokens', 300)
+          self.declare_parameter('timeout', 30)
+          self.declare_parameter('max_retries', 2)
 
-### 2.1 硬件平台
+          self.api_key = self.get_parameter('api_key').value
+          self.model = self.get_parameter('model').value
+          self.camera_topic = self.get_parameter('camera_topic').value
+          self.max_tokens = self.get_parameter('max_tokens').value
+          self.timeout = self.get_parameter('timeout').value
+          self.max_retries = self.get_parameter('max_retries').value
 
-| 组件 | 型号/规格 |
-|------|-----------|
-| 主控板 | RDK X5 (地瓜机器人) |
-| 底盘 | OriginCar 阿克曼底盘 |
-| 激光雷达 | LSLIDAR N10（10Hz 机械旋转式激光雷达） |
-| 深度相机 | Aurora930 |
-| IMU | 板载 IMU，经 EKF 融合 |
+          if not self.api_key:
+              self.get_logger().fatal(
+                  'DASHSCOPE_API_KEY 未设置。请通过环境变量或 --ros-args -p api_key:=xxx 传入'
+              )
+              raise RuntimeError('API key not set')
 
-### 2.2 软件架构
+          self.bridge = CvBridge()
+          self.latest_image = None
+          self._busy = False
 
-系统基于 **ROS2 Humble** 构建，采用分层软件架构：
+          self.sub = self.create_subscription(Image, self.camera_topic, self._img_cb, 10)
+          self.pub = self.create_publisher(String, '/vlm/description', 10)
 
-```
-┌─────────────────────────────────────────┐
-│              控制面板 (control_panel)      │
-│         QR 方向显示 / AI 识别结果          │
-└─────────────────────────────────────────┘
-                    │
-┌─────────────────────────────────────────┐
-│         路径跟随层 (origincar_pid_nav)     │
-│   PID 赛线跟踪 / 雷达避障 / 锥桶绕行        │
-│   倒车处理 / 急停 / 减速控制               │
-└─────────────────────────────────────────┘
-                    │
-┌─────────────────────────────────────────┐
-│            感知与定位层                     │
-│  N10 雷达 → /scan                        │
-│  Aurora930 深度相机 → /aurora/*            │
-│  AMCL 定位 + EKF 融合 → /tf, /odom        │
-│  QR 检测 → /qr_info                      │
-└─────────────────────────────────────────┘
-                    │
-┌─────────────────────────────────────────┐
-│            驱动层 (origincar_base)         │
-│  底盘串口通信 / 电机控制 / 编码器反馈        │
-└─────────────────────────────────────────┘
-```
+          hz = self.get_parameter('inference_hz').value
+          self.timer = self.create_timer(1.0 / max(hz, 0.05), self._infer)
 
-### 2.3 核心导航方案
+          self.get_logger().info(
+              f'cloud_vlm ready | camera={self.camera_topic} model={self.model}'
+          )
 
-采用 **PID + 激光雷达巡线** 方案，不依赖 Nav2 规划器进行实时路径跟随，仅保留 AMCL 提供地图坐标系下定位。
+      def _img_cb(self, msg):
+          self.latest_image = msg
 
-**路径跟随器（origincar_pid_nav）** 为核心控制节点，工作流程如下：
+      def _infer(self):
+          if self.latest_image is None or self._busy:
+              return
+          self._busy = True
 
-1. **赛线模式（race_line_mode）**：从 waypoints.yaml 读取预设路径点，以 lookahead_distance（0.55m）前视距离追踪赛线。使用 PID 控制器（Kp=0.85, Ki=0.00, Kd=0.10）计算角速度输出，直接发布 `/cmd_vel` 控制底盘。
+          try:
+              import cv2
+              cv_img = self.bridge.imgmsg_to_cv2(self.latest_image, 'bgr8')
+              _, buf = cv2.imencode('.jpg', cv_img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+              b64 = base64.b64encode(buf).decode('utf-8')
 
-2. **激光雷达避障 — 通行走廊过滤**：将雷达点云裁剪至车身通行走廊（半宽 0.15m），仅走廊内的障碍触发响应，避免贴墙时误判减速或停车。
+              payload = {
+                  "model": self.model,
+                  "messages": [{
+                      "role": "user",
+                      "content": [
+                          {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                          {"type": "text", "text": "请用一段中文描述这张图片里的场景：有什么人物、他们在做什么、有哪些物
+  体、环境怎样。"},
+                      ],
+                  }],
+                  "max_tokens": self.max_tokens,
+              }
+              headers = {
+                  "Authorization": f"Bearer {self.api_key}",
+                  "Content-Type": "application/json",
+              }
 
-3. **锥桶绕行（forward_obstacle_bypass）**：前方障碍距离小于触发阈值（1.05m）时，计算侧向绕行目标（偏移 0.36m），绕过障碍后自动回到原赛线。绕行方向根据侧向净空（≥0.24m）自动判定。
+              for attempt in range(self.max_retries + 1):
+                  try:
+                      t0 = time.time()
+                      resp = requests.post(DASHSCOPE_URL, headers=headers, json=payload, timeout=self.timeout)
+                      elapsed = time.time() - t0
 
-4. **动态速度控制**：
-   - 普通前进速度：0.60 m/s
-   - 前方障碍减速距离 1.10m，最低速度比例 55%
-   - 急停距离 0.35m（前方障碍过近）
-   - 接近最后一个点时关闭前进避障限速，防止终点贴墙蠕动
+                      if resp.status_code == 200:
+                          text = resp.json()["choices"][0]["message"]["content"]
+                          self.get_logger().info(f'[VLM] {text}  ({elapsed:.1f}s)')
+                          msg = String()
+                          msg.data = text
+                          self.pub.publish(msg)
+                          break
+                      else:
+                          self.get_logger().warn(
+                              f'API {resp.status_code} attempt {attempt+1}: {resp.text[:150]}'
+                          )
+                          if attempt < self.max_retries:
+                              time.sleep(1)
+                          else:
+                              self.get_logger().error(f'API 请求最终失败: {resp.status_code}')
+                  except requests.Timeout:
+                      self.get_logger().warn(f'超时 attempt {attempt+1}/{self.max_retries+1}')
+                  except Exception as e:
+                      self.get_logger().warn(f'异常 attempt {attempt+1}: {e}')
 
-5. **倒车与跳点**：倒车点位遇后方障碍（<0.28m），自动跳过当前倒车点前往下一点。起点附近点位（<0.70m 半径）自动跳过，避免路径起步回头。
+          except Exception as e:
+              self.get_logger().error(f'推理失败: {e}', throttle_duration_sec=30)
+          finally:
+              self._busy = False
 
-### 2.4 辅助功能
 
-- **QR 码方向选择**：通过 Aurora930 RGB 图像检测 QR 码，奇数为顺时针路线，偶数为逆时针路线，自动确定行进方向。
-- **地图与定位**：预构建 `race_modify` 占据栅格地图（0.05m 分辨率），AMCL 提供全局定位，EKF 融合底盘里程计和 IMU 数据。
-- **Keepout 区域**：使用 keepout 滤镜标记不可通行区域，防止车辆驶出赛道边界。
+def main(args=None):
+      rclpy.init(args=args)
+      try:
+          rclpy.spin(CloudVLMNode())
+      except RuntimeError:
+          pass
+      except KeyboardInterrupt:
+          pass
+      finally:
+          rclpy.try_shutdown()
 
-### 2.5 路径点配置
 
-路径点通过 YAML 格式定义，包含顺时针和逆时针两套路线，每套约 11 个关键点位。支持点位的 yaw 角、通过半径、倒车标记等属性。
-
----
-
+if __name__ == '__main__':
+      main()
